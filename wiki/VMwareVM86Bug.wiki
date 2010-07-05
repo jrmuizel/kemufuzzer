@@ -11,7 +11,7 @@ Now that KEmuFuzzer supports testing the CPU of the VMM in VM86 mode we can try 
 We wrote a very simple test-case to reproduce the scenario described by Tavis and Julien. 
 A brief demo follows.
 
-   # Run the test case in VMware and got in output the CPU states before and after the execution of the testcase:
+   * Run the test case in VMware and got in output the CPU states before and after the execution of the testcase:
 
 {{{
 $ ./kemufuzzer emu:VMWARE kerneldir:$./kernel kernel:./kernel/kernel floppy:./kernel/floppy.img testcase:../test-cases/vm_CVE-2009-2267.0000.testcase outdir:./states/vmware/
@@ -21,7 +21,7 @@ $ ./kemufuzzer emu:VMWARE kerneldir:$./kernel kernel:./kernel/kernel floppy:./ke
 [*] Flushing state '/tmp/kemufuzzer-post-kpDlBH' -> './states/vmware/vm_CVE-2009-2267.0000.post'
 }}}
 
-   # Run the same test-case in the KVM-based oracle (starting from the same initial state):
+   * Run the same test-case in the KVM-based oracle (starting from the same initial state):
 
 {{{
 $ ././kemufuzzer emu:KVM kerneldir:$./kernel kernel:./kernel/kernel floppy:./kernel/floppy.img testcase:../test-cases/vm_CVE-2009-2267.0000.testcase pre:./states/vmware/vm_CVE-2009-2267.0000.pre post:./states/kvm/vmware/vm_CVE-2009-2267.0000.post
@@ -30,7 +30,7 @@ $ ././kemufuzzer emu:KVM kerneldir:$./kernel kernel:./kernel/kernel floppy:./ker
 [*] Flushing state '/tmp/kemufuzzer-post-zE813H' -> './states/kvm/vm_CVE-2009-2267.0000.post'
 }}}
 
-   # Compare the states of the end of the execution:
+   * Compare the states of the end of the execution:
 
 {{{
 $ ./x86_cpustate_diff ./states/vmware/vm_CVE-2009-2267.0000.post ./states/kvm/vm_CVE-2009-2267.0000.post
