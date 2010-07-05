@@ -251,11 +251,6 @@ void kmain(int magic, multiboot_info_t *mbi)
 
   /* far call entry GDT (segment selector) */
   
-  //set_tss(&tssVM, 0, 0x100, (get_eflags()|VM_BIT), 
-/*   set_tss(&tssVM, 0, espVM, 0x20302,  */
-/* 	  SEL_VM_CS, SEL_VM_DS, SEL_VM_SS, get_cr3(),  */
-/* 	  SEL_RPL(SEL_RING0_SS,0), SEL_RPL(SEL_RING1_SS,1), SEL_RPL(SEL_RING2_SS,2), esp0, esp1, esp2, 0xc8); */
-
   set_tss(&tssVM, VM_EIP, VM_ESP, (get_eflags()|VM_BIT), 
 	  SEL_VM_CS, SEL_VM_DS, SEL_VM_SS, get_cr3(), 
 	  SEL_RPL(SEL_RING0_SS,0), SEL_RPL(SEL_RING1_SS,1), SEL_RPL(SEL_RING2_SS,2), esp0, esp1, esp2, 0xc8);
