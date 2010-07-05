@@ -1,10 +1,10 @@
-#summary KEmuFuzzer & CVE-2009-2267
-
 We just extended KEmuFuzzer to support the testing of VM86 mode. 
 
 = CVE-2009-2267 =
 
 Last year Tavis Ormandy and Julien Tinnes found a nasty bug in VMware that allows a local attacker to escalate privileges. The bug manifests when a page fault occurs in VM86 mode. The VMM always saves the exception code in the stack with the U/S (user/supervisor) bit cleared. 
+
+Now that KEmuFuzzer supports testing the CPU of the VMM in VM86 mode we can try to reproduce the VMware bug and, hopefully, find new ones.
 
 = Reproducing the bug with KEmuFuzzer =
 
