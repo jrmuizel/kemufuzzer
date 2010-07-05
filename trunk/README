@@ -1,0 +1,214 @@
+KEMUFUZZER
+==========
+
+KEmuFuzzer is a tool to test system virtual machines based on emulation or
+direct native execution.
+
+Currently KEmuFuzzer supports: BHOCS, QEMU, VMware, and VirtualBox.
+
+
+AUTHORS
+=======
+
+* Lorenzo Martignoni         <martignlo@gmail.com>
+* Roberto Paleari            <roberto.paleari@gmail.com>
+* Giampaolo Fresi Roglia     <gianz@security.dico.unimi.it>
+
+
+COPYRIGHT
+=========
+
+KEmuFuzzer is released under GNU GPLv3 license. See the file COPYING for more
+information or vist http://www.gnu.org/licenses/.
+
+
+USAGE
+=====
+
+To compile a test-case from a template use the following command line (compiled
+test-cases will be store in the directory of the templates):
+
+tc_template $DATA/test-cases/sysenter.template
+
+See the code of 'tc_template' for the list of symbolic operators currently
+supported.
+
+
+To generate a floppy image for a particular test-case:
+
+tc_generate $DATA/test-cases/sysenter.0000.testcase [kernel] [floppy]
+
+The optional arguments 'kernel' and 'floppy' denote the base kernel and floppy
+image.
+
+
+To view a test-case:
+
+tc_view $DATA/test-cases/sysenter.0000.testcase
+
+
+To run a test-case in an emulator use the following command line:
+
+kemufuzzer emu:VBOX \
+	   kerneldir:$DATA/kernels \
+	   kernel:$DATA/kernels/kernel \
+	   floppy:$DATA/kernels/floppy.img 
+	   testcase:$DATA/test-cases/sysenter.0000.testcase \
+	   outdir:$DATA/vbox
+
+ - emu: emulator to test
+
+ - kerneldir: directory containing various kernel versions; KEmuFuzzer will
+   create a copy of the kernel into a file whose name corresponds to the md5 of
+   the kernel
+
+ - kernel: kernel used to bootstrap the emulator
+
+ - floppy: floppy image used to bootstrap the emulator
+
+ - testcase: test-case to run
+
+ - outdir: directory in which the state of the CPU of the emulator will be
+   dumped (called respectively sysenter.0000.pre and sysenter.0000.post)
+
+Alternatively, 'outdir' can be replaced with 'pre' and 'post' to use explicit
+file names. You can also optionally use the following arguments:
+
+ - gui: starts the gui
+
+ - nokill: do not kill the emulator after the execution of the test-case
+
+KEmuFuzzer will create a new floppy image with a patched kernel and will create
+two dumps of the state of the CPU.
+
+
+To run a test-case in the oracle (KVM) use the following command line:
+
+kemufuzzer emu:KVM
+	   kerneldir:$DATA/kernels \
+	   kernel:$DATA/kernels/kernel \
+	   floppy:$DATA/kernels/floppy.img \
+	   pre:$DATA/vbox/sysenter.0000.testcase \
+	   post:$DATA/kvm/vbox/sysenter.0000.post
+
+  - pre: name of the file containing the state of the CPU of the emulator that
+    preceded the execution of the test-case
+
+
+To compare the states of the CPU use the following command:
+
+x86_cpustate_diff $DATA/vbox/sysenter.0000.post $DATA/kvm/vbox/sysenter.0000.post
+
+Optional arguments are:
+
+  - update_guest: update the state of the guest preceding the invocation of the
+    exception handler
+
+  - kernel_dir: directory containing the kernels (e.g.,
+    kerneldir:$DATA/kernels) used for symbols resolutions
+
+
+The makefile 'run.makefile' can be used to automatize the testing. For example,
+for the tesing of BOCHS, QEMU, VMware, and VirtualBox we used the following the
+directory tree:
+
+   |-- bochs
+   |-- diffs
+   |   |-- bochs
+   |   |-- qemu
+   |   |-- vbox
+   |   `-- vmware
+   |-- kernels
+   |-- kvm
+   |   |-- bochs
+   |   |-- qemu
+   |   |-- vbox
+   |   `-- vmware
+   |-- qemu
+   |-- test-cases
+   |-- vbox
+   `-- vmware
+   
+
+NOTES
+=====
+
+In order to use KEmuFuzzer with BOCHS, QEMU, and VirtualBox you need to patch
+their code. Patches are available on the web.
+
+
+ADDING SUPPORT FOR A NEW EMULATOR
+=================================
+
+Adding the support for a new emulator is very easy.  Essentially what you have
+to do is to create a fake device (e.g., a fake serial port) and bind it to I/O
+ports KEMUFUZZER_HYPERCALL_START_TESTCASE (0x23) and
+KEMUFUZZER_HYPERCALL_STOP_TESTCASE (0x45). The first port is used to notify the
+beginning of a test-case and the second one to notify the end. When you receive
+any of these two commands you have to dump the state of the CPU to disk. The
+format of the dump is the following:
+
+* header (struct header_t)
+* cpu state (struct cpu_state_t)
+* physical memory (raw dump of the physical memory)
+
+To save disk space you can compress the dump using 'zlib'.
+
+Have a look at the patch we wrote for QEMU, especially at the following
+functions:
+
+* kemufuzzer_ioport_start
+* kemufuzzer_ioport_stop
+* kemufuzzer_save
+* kemufuzzer_init
+
+Note that when we receive a command on port KEMUFUZZER_HYPERCALL_STOP_TESTCASE
+we inspect the memory to extract information about the reason for the
+termination of the test-case (exception or clean termination). The information
+is located 4 bytes after the program counter (*((uint16_t *) (e + 4)), where e
+= eip + cs.base).
+
+You also have to modify the 'kemufuzzer' script and write a new class to invoke
+the new emulator with the proper command line. 4MB of RAM should be sufficient
+to boot the kernel and run any experiment.
+
+
+TEST-CASES
+==========
+
+Test-cases are very easy to write. A test-case is a XML document containing
+assembly code:
+
+<testcase ring="0">
+ <ring0>
+  mov $0xe0000019, %eax;
+  orl KEF_BITS32, %eax;
+  mov %eax, %cr0;
+ </ring0>
+</testcase>
+
+The root of the document has a child node for each of the four privilege levels
+supported by the architecture. However, child nodes with no code can be
+omitted. An attribute of the root node (start_ring) controls in which privilege
+level the execution begins. The test-case is compiled by a special compiler
+'tc_template' that pre-processes the code and assembles the instructions.
+Test-cases can contain several symbolic operators (e.g., KEF_BITS32) that are
+substituted during preprocessing. Symbolic operators are used to facilitate the
+writing and to compile a single XML document into multiple test-cases. For
+example the 'KEF_BITS32' operator stands for multiple 32-bit integer
+values. The compiler will generate the various values and generate multiple
+variants of the test-case, each of which will use a different value. See the
+compiler code for a list of supported symbolic operators.
+
+You can write test-cases containing multiple ring nodes and containing assembly
+instructions to jump from one ring to another (e.g., system calls and far
+jumps). Moreover, the root node can have another special attribute,
+'random_ring'. This attribute specifies that an execution ring must be
+randomized. Have a look a the sample test-cases on the web to have an idea of
+the kind of testing you can perform.
+
+The files containing test-cases in XML format must have the '.template'
+extension. They will be compiled by 'tc_template' in multiple binary files,
+with '.NNNN.testcase' extension. The 'NNNN' suffix is used to distinguish
+between the various variants of the same test-case.
+

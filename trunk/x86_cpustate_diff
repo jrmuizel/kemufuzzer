@@ -1,0 +1,471 @@
+#!/usr/bin/python
+
+# This file is part of KEmuFuzzer.
+# 
+# KEmuFuzzer is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+# 
+# KEmuFuzzer is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along with
+# KEmuFuzzer.  If not, see <http://www.gnu.org/licenses/>.
+
+
+import sys, gzip, copy
+from x86_cpustate import *
+
+def null_segment_descriptor():
+    s = segment_reg_t()
+    s.base     = 0
+    s.limit    = 0
+    s.selector = 0
+    s.present  = 0
+    s.type     = 0
+    s.dpl      = 0
+    s.db       = 0
+    s.s        = 0
+    s.l        = 0
+    s.g        = 0
+    s.avl      = 0
+    s.unusable = 0
+
+    return s
+
+def emulator_name(d):
+    if is_valid_type(d.hdr.type):
+        s = "%16s" % EMULATORS[d.hdr.emulator][:16]
+    else:
+        s = colorize("%16s" % EMULATORS[d.hdr.emulator][:16])
+    return s
+
+def parse_state_recurse(d, p, h = None):
+    fields = getattr(d, "_fields_", None)
+
+    if h is None:
+        h = {}
+
+    if p in ["hdr.kernel_version", "hdr.kernel_checksum", "hdr.testcase_checksum"]:
+        h[p] = d
+    # dirty hack to detect ctypes array
+    elif getattr(d, "__getslice__", None):
+        # Index MSR registers by their idx
+        if "msrs_state.msr_regs" in p:
+            for e in range(h[p.replace(".msr_regs", ".n")]):
+                h["%s[%.8x]" % (p, d[e].idx)] = d[e].val
+        else:
+            for e in range(len(d)):
+                parse_state_recurse(d[e], "%s[%d]" % (p, e), h)
+    elif not fields:
+        h[p] = d
+    else:
+        for n,t in fields:
+            parse_state_recurse(getattr(d, n), "%s.%s" % (p, n), h)
+
+def parse_state(d):
+    h = {}
+    parse_state_recurse(d.hdr, "hdr", h)
+
+    for i in range(h["hdr.cpusno"]):
+        parse_state_recurse(d.cpus[i], "cpu[%d]" % i, h)
+
+    h["mem"] = d.mem.data
+
+    return h
+
+RED    = 31
+GREEN  = 32
+YELLOW = 33
+BLUE   = 34
+
+def colorize(s, color = RED):
+    return (chr(0x1B) + "[0;%dm" % color + str(s) + chr(0x1B) + "[0m")
+
+def pretty_diff(dd):
+    assert not diff([len(d) for d in dd])
+
+    ddc = ["" for i in range(len(dd))]
+
+    for i in range(len(dd[0])):
+        di = [d[i] for d in dd]
+        for j in range(len(di)):
+            d = di[j]
+            if d != " " and diff(di):
+                if (len(filter(lambda a: a == d, di)) / float(len(di))) > \
+                        2/float(3):
+                    color = GREEN
+                elif (len(filter(lambda a: a == d, di)) / float(len(di))) > \
+                        1/float(3):
+                    color = YELLOW
+                else:
+                    color = RED
+                ddc[j] += colorize(d, color)
+            else:
+                ddc[j] += d
+
+    return ddc
+
+def diff(dd):
+    return len(set(dd)) > 1
+
+def diff_dumps(files, kernel_dir = None, update_guest = False,
+               pretty_print = False, strict_check = True, normalize = True):
+    dumps = []
+    for f in files:
+        try:
+            d = gzip.open(f).read()
+        except IOError:
+            d = open(f).read()
+
+        d = X86Dump(d, kernel_dir)
+
+        dumps += [d]
+
+    kernel_versions = [d.hdr.kernel_version for d in dumps]
+    kernel_checksums = [d.hdr.kernel_checksum for d in dumps]
+    testcase_checksums = [d.hdr.testcase_checksum for d in dumps]
+
+    if strict_check:
+        if diff(kernel_versions):
+            print "[W] Mismatching kernel version: %s" % (" ".join(kernel_versions))
+
+        assert not diff(kernel_checksums), \
+            "[!] Mismatching kernel checksum: %s" % (" ".join(kernel_checksums))
+
+        assert not diff(testcase_checksums), \
+            "[!] Mismatching testcase checksum: %s" % (" ".join(testcase_checksums))
+
+    mem_sizes = []
+    for d in dumps:
+        if is_valid_type(d.hdr.type):
+            mem_sizes.append(d.hdr.mem_size)
+
+    assert not diff(mem_sizes), \
+        "[!] Mismatching guest memory sizes: %s" % (" ".join(mem_sizes))
+
+    for d in dumps:
+        if d.hdr.type & IO_TESTCASE:
+            return []
+
+    tmp = None
+    for d in dumps:
+        if is_valid_type(d.hdr.type):
+            tmp = d
+            break
+
+    if tmp is not None:
+        # Fix CPU and memory states for invalid dumps
+        for d in dumps:
+            if not is_valid_type(d.hdr.type):
+                d.hdr.mem_size = tmp.hdr.mem_size
+                d.hdr.cpusno = 1
+                d.cpus.append(tmp.cpus[0])
+                d.mem = X86DumpMemory("?"*tmp.hdr.mem_size)
+
+    if normalize:
+        normalize_states(dumps)
+
+    if update_guest:
+        for d in dumps:
+            if is_valid_type(d.hdr.type):
+                for i in range(len(d.cpus)):
+                    d.guess_guest_ctx(i)
+
+    states = [parse_state(d) for d in dumps]
+    keys = states[0].keys()
+    keys.sort()
+
+    # Header
+    if not diff(kernel_versions) and dumps[0].kernel:
+        print "%41s" % "(RED = invalid dump)" + " ".join([emulator_name(d) for d in dumps]) \
+            + " %32s" % " Section/Symbol"
+        print "="*(41+(len(dumps)-1)+(16*len(dumps))+33)
+    else:
+        print "%41s" % "(RED = invalid dump)" + " ".join([emulator_name(d) for d in dumps]) 
+        print "="*(41+(len(dumps)-1)+(16*len(dumps)))
+
+    dd = []
+
+    for k in keys:
+        # Fields to be ignored
+        if k in ["hdr.emulator"]:
+            continue
+
+        if k == "mem":
+            # Skip the first MB where all devices are mapped
+            for j in range(1024*1024, len(states[0][k]), 4096):
+                # Quick check (if the content of the pages is the same it is
+                # useless to perform a more fine grained comparison)
+                ss = [s[k][j:j+4096] for s in states]
+                if not diff(ss):
+                    continue
+
+                tmp = set(ss)
+                if len(tmp) == 2 and '?'*4096 in tmp:
+                    # There is only a difference on an invalid state
+                    continue
+
+                for i in range(j, j + 4096, 4):
+                    ss = [s[k][i:i+4] for s in states]
+
+                    tmp = set(ss)
+                    dummy_diff = (len(tmp) == 2 and '????' in tmp)
+                    
+                    if diff(ss) and not dummy_diff:
+                        ww = []
+                        for s in ss:
+                            if s[:4] == '????':
+                                data = '????'
+                            else:
+                                data = "%.2x%.2x%.2x%.2x" % (ord(s[0]), ord(s[1]), 
+                                                             ord(s[2]), ord(s[3]))
+                            w = "%16s" % data
+                            ww.append(w)
+
+                        if pretty_print:
+                            ww = pretty_diff(ww)
+
+                        # resolve symbols
+                        sec = ""
+                        if not diff(kernel_versions) and dumps[0].kernel:
+                            if dumps[0].kernel.findSection(i):
+                                sec = dumps[0].kernel.findSection(i)
+                                if sec.getName().startswith(".tcring") and \
+                                        i <= sec.getLowAddr() + (sec.getSize() / 2) and \
+                                        i >= sec.getLowAddr() + (sec.getSize() / 2) - 64:
+                                    sec = "%s/stack [%x]" % (sec.getName(), sec.getLowAddr())
+                                else:
+                                    sec = "%s (%x)" % (sec.getName(), sec.getLowAddr())
+                            for sym in dumps[0].kernel.getSymbol():
+                                if sym.getAddress() <= i and \
+                                        sym.getAddress() + sym.getSize() >= i:
+                                    if sym.getName() in ["gdt", "idt"]:
+                                        sec = "%s[%d]" % (sym.getName(), 
+                                                          (i - sym.getAddress()) / 8)
+                                    elif sym.getName().startswith("tss"):
+                                        sec = "%s[%d]" % (sym.getName(), 
+                                                          (i - sym.getAddress()))
+                                    else:
+                                        sec = "%s (%x)" % (sym.getName(), 
+                                                           sym.getAddress())
+                                    break
+
+                        # Record this difference
+                        data = []
+                        for s in states:
+                            m = s[k][i:i+4]
+                            e = s['hdr.emulator']
+                            t = s['hdr.type']
+                            data.append((m,e,t))
+                        dd.append((k, i, data))
+
+                        print "%-40s %s %32s" % ("%s[%.16x]" % (k, i), 
+                                                 " ".join(ww), sec)
+
+                    elif diff(ss):
+                        # Record this difference
+                        data = []
+                        for s in states:
+                            m = s[k][i:i+4]
+                            e = s['hdr.emulator']
+                            t = s['hdr.type']
+                            data.append((m,e,t))
+                        dd.append((k, i, data))
+
+        else:
+            skip = False
+            for s in states:
+                if not k in s:
+                    skip = True
+                    break
+
+            if skip:
+                continue
+
+            ss = []
+            for s in states:
+                if not is_valid_type(s["hdr.type"]):
+                    v = "????"
+                else:
+                    v = s[k]
+                ss.append(v)
+
+            tmp = set(ss)
+            dummy_diff = len(tmp) == 2 and "????" in tmp
+
+            if diff(ss) and not dummy_diff:
+                if k in ["hdr.kernel_version", "hdr.kernel_checksum", 
+                         "hdr.testcase_checksum"]:
+                    ww = ["%16s" % s[:16] for s in ss]
+                    if pretty_print:
+                        ww = [colorize(w) for w in ww]
+                else:
+                    ww = []
+                    for s in ss:
+                        if s == "????":
+                            ww.append("%16s" % s)
+                        else:
+                            ww.append("%16x" % s)
+
+                    if pretty_print:
+                        ww = pretty_diff(ww)
+
+
+                # Record this difference
+                data = []
+                for s in states:
+                    v = s[k]
+                    e = s['hdr.emulator']
+                    t = s['hdr.type']
+                    data.append((v,e,t))
+                dd.append((k, None, data))
+
+                print "%-40s %s" % (k, " ".join(ww))
+            elif diff(ss):
+                # Record this difference
+                data = []
+                for s in states:
+                    v = s[k]
+                    e = s['hdr.emulator']
+                    t = s['hdr.type']
+                    data.append((v,e,t))
+                dd.append((k, None, data))
+                
+    
+    return dd
+                    
+def normalize_states(dumps):
+    # Consider only the first 32 bits of general purpose registers
+    for d in dumps:
+        for c in d.cpus:
+            r = c.regs_state
+            r.rip &= 0xffffffff
+            r.rflags &= 0xffffffff
+            r.rax &= 0xffffffff
+            r.rbx &= 0xffffffff
+            r.rcx &= 0xffffffff
+            r.rdx &= 0xffffffff
+            r.rsi &= 0xffffffff
+            r.rdi &= 0xffffffff
+            r.rsp &= 0xffffffff
+            r.rbp &= 0xffffffff
+
+    # Ignore FPU reserved bits
+    for d in dumps:
+        for c in d.cpus:
+            for st in c.fpu_state.st:
+                st.reserved[5] = 0
+
+    # Ignore dr{0,1,2,3,6} because not virtualized
+    for d in dumps:
+        for c in d.cpus:
+            c.sregs_state.dr0 = 0
+            c.sregs_state.dr1 = 0
+            c.sregs_state.dr2 = 0
+            c.sregs_state.dr3 = 0
+            c.sregs_state.dr6 = 0
+
+    # Keep only meaningful MSRs
+    MSR_REGS = [X86_MSR_IA32_SYSENTER_CS, X86_MSR_IA32_SYSENTER_ESP, 
+                X86_MSR_IA32_SYSENTER_EIP]
+    for d in dumps:
+        for c in d.cpus:
+            c.msrs_state.n = len(MSR_REGS)         
+            for r in c.msrs_state.msr_regs:
+                if not r.idx in MSR_REGS:
+                    r.idx = 0
+                    r.val = 0            
+
+    # These normalizations are used to ignore state fields that are not updated
+    # by the emulator drivers
+    emulators = [d.hdr.emulator for d in dumps]
+
+    # Ignore segment descriptors cache
+    for d in dumps:
+        if not is_valid_type(d.hdr.type):
+            continue
+        i = 0
+        for c in d.cpus:
+            for seg in [c.sregs_state.cs, c.sregs_state.ds, c.sregs_state.es, \
+                            c.sregs_state.fs, c.sregs_state.gs, c.sregs_state.ss]:
+                seg = d.parse_seg(i, seg.selector)
+            i += 1
+
+    if EMULATOR_VMWARE in emulators:
+        # VMWARE-specific normalization
+        for d in dumps:
+            for c in d.cpus:
+                # Ignore TR segment state
+                c.sregs_state.tr = null_segment_descriptor()
+                
+                # Ignore FPU state
+                c.fpu_state.fcw        = 0
+                c.fpu_state.ftw        = 0
+                c.fpu_state.mxcsr      = 0
+                c.fpu_state.mxcsr_mask = 0
+
+    # Ignore fpu.mxcsr_mask because KVM does not handle it
+    if EMULATOR_KVM in emulators:
+        for d in dumps:
+            for c in d.cpus:
+                c.fpu_state.mxcsr_mask = 0
+
+def main():
+    args = {
+        "update_guest" : os.getenv("KEMUFUZZER_UPDATE_GUEST", False),
+        "pretty_print" : os.getenv("KEMUFUZZER_PRETTY_PRINT", True),
+        "strict_check" : os.getenv("KEMUFUZZER_STRICT_CHECK", True),
+        "kernel_dir" : os.getenv("KEMUFUZZER_KERNEL_DIR", None),
+        "normalize" : os.getenv("KEMUFUZZER_NORMALIZE_DUMP", True),
+        }
+
+    dumps = []
+
+    for i in sys.argv[1:]:
+        try:
+            a, v = i.split(":")
+            args[a] = v
+        except Exception:
+            dumps += [i]
+        
+    assert len(dumps) >= 1
+
+    # Try current dir
+    if not args["kernel_dir"] and os.path.isdir("./kernels"):
+        args["kernel_dir"] = os.path.abspath("./kernels")
+
+    if len(dumps) >= 2:
+        # diff
+        found_diffs = diff_dumps(dumps, update_guest = bool(args["update_guest"]), 
+                                 kernel_dir = args["kernel_dir"], 
+                                 pretty_print = bool(args["pretty_print"]), 
+                                 strict_check = bool(args["strict_check"]),
+                                 normalize = bool(args["normalize"]))
+
+        if len(found_diffs) == 0:
+            r = 0
+        else:
+            r = 1
+
+        exit(r)
+    else:
+        # read a single dump file from stdin
+        try:
+            data = gzip.open(dumps[0]).read()
+        except IOError:
+            data = open(dumps[0]).read()
+
+        d = X86Dump(data, kernel_dir = args["kernel_dir"])
+        if is_valid_type(d.hdr.type):
+            if args["update_guest"]:
+                for i in range(len(d.cpus)):
+                    d.guess_guest_ctx(i)
+
+        print d
+
+if __name__ == "__main__":
+    main()
+

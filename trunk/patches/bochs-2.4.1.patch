@@ -1,0 +1,804 @@
+diff -Naur bochs-2.4.1-vanilla/configure.in bochs-2.4.1-kemufuzzer/configure.in
+--- bochs-2.4.1-vanilla/configure.in	2010-02-08 15:37:44.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/configure.in	2010-02-08 15:36:57.000000000 +0100
+@@ -1305,6 +1305,8 @@
+     AC_DEFINE(BX_INSTRUMENTATION, 1)
+     INSTRUMENT_DIR=$enableval
+     INSTRUMENT_VAR='$(INSTRUMENT_LIB)'
++    dnl this is required just for the KEmuFuzzer plugin. Any better place where to put this?
++    LIBS="$LIBS -lz"
+    fi],
+   [
+     AC_MSG_RESULT(no)
+diff -Naur bochs-2.4.1-vanilla/instrument/kemufuzzer/instrument.cc bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/instrument.cc
+--- bochs-2.4.1-vanilla/instrument/kemufuzzer/instrument.cc	1970-01-01 01:00:00.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/instrument.cc	2010-02-08 14:58:25.000000000 +0100
+@@ -0,0 +1,401 @@
++#include <zlib.h>
++
++#define NEED_CPU_REG_SHORTCUTS 1
++#include "bochs.h"
++#include "cpu/cpu.h"
++#define LOG_THIS BX_CPU_THIS_PTR 
++
++#if BX_INSTRUMENTATION
++
++void bx_instr_init_env(void) {}
++void bx_instr_exit_env(void) {}
++
++void bx_instr_exit(unsigned cpu) {}
++void bx_instr_reset(unsigned cpu, unsigned type) {}
++void bx_instr_hlt(unsigned cpu) {}
++void bx_instr_mwait(unsigned cpu, bx_phy_address addr, unsigned len, Bit32u flags) {}
++void bx_instr_new_instruction(unsigned cpu) {}
++
++void bx_instr_debug_promt() {}
++void bx_instr_debug_cmd(const char *cmd) {}
++
++void bx_instr_cnear_branch_taken(unsigned cpu, bx_address new_eip) {}
++void bx_instr_cnear_branch_not_taken(unsigned cpu) {}
++void bx_instr_ucnear_branch(unsigned cpu, unsigned what, bx_address new_eip) {}
++void bx_instr_far_branch(unsigned cpu, unsigned what, Bit16u new_cs, bx_address new_eip) {}
++
++void bx_instr_opcode(unsigned cpu, const Bit8u *opcode, unsigned len, bx_bool is32, bx_bool is64) {}
++
++void bx_instr_interrupt(unsigned cpu, unsigned vector) {}
++void bx_instr_exception(unsigned cpu, unsigned vector, unsigned error_code) {}
++void bx_instr_hwinterrupt(unsigned cpu, unsigned vector, Bit16u cs, bx_address eip) {}
++
++void bx_instr_tlb_cntrl(unsigned cpu, unsigned what, bx_phy_address new_cr3) {}
++void bx_instr_clflush(unsigned cpu, bx_address laddr, bx_phy_address paddr) {}
++void bx_instr_cache_cntrl(unsigned cpu, unsigned what) {}
++void bx_instr_prefetch_hint(unsigned cpu, unsigned what, unsigned seg, bx_address offset) {}
++
++void bx_instr_before_execution(unsigned cpu, bxInstruction_c *i) {}
++void bx_instr_after_execution(unsigned cpu, bxInstruction_c *i) {}
++void bx_instr_repeat_iteration(unsigned cpu, bxInstruction_c *i) {}
++
++void bx_instr_inp(Bit16u addr, unsigned len) {}
++void bx_instr_inp2(Bit16u addr, unsigned len, unsigned val) {}
++
++void bx_instr_mem_data_access(unsigned cpu, unsigned seg, bx_address offset, unsigned len, unsigned rw) {}
++void bx_instr_lin_access(unsigned cpu, bx_address lin, bx_address phy, unsigned len, unsigned rw) {}
++
++void bx_instr_phy_write(unsigned cpu, bx_address addr, unsigned len) {}
++void bx_instr_phy_read(unsigned cpu, bx_address addr, unsigned len) {}
++
++void bx_instr_wrmsr(unsigned cpu, unsigned addr, Bit64u value) {}
++
++// ##################################################
++
++#include "x86_cpustate.h"
++
++#define  KEMUFUZZER_PRE_STATE      0
++#define  KEMUFUZZER_POST_STATE     1
++
++#define get_bochs_segment(dst, src) {					\
++    dst.base = src.cache.u.segment.base;				\
++    dst.limit = src.cache.u.segment.limit_scaled;			\
++    dst.selector = src.selector.value;					\
++    dst.type = src.cache.type;						\
++    dst.present = src.cache.p;						\
++    dst.dpl = src.cache.dpl;						\
++    dst.db = src.cache.u.segment.d_b;					\
++    dst.s = src.cache.segment;						\
++    dst.l = src.cache.u.segment.l & 1;					\
++    dst.g = src.cache.u.segment.g;					\
++    dst.avl = src.cache.u.segment.avl;					\
++    dst.unusable = 0;							\
++  }
++
++#define get_bochs_table(dst, src) { \
++    dst.base = src.base;	  \
++    dst.limit = src.limit;	  \
++  }
++
++typedef struct {
++  int initialized;
++  int signalled;
++} t_kemufuzzer_state;
++
++static t_kemufuzzer_state kemufuzzer_state = { 0, 0 };
++
++static void     kemufuzzer_start(void);
++static void     kemufuzzer_stop(int);
++static void     kemufuzzer_save(int, int);
++static void     kemufuzzer_fxsave(fpu_state_t*);
++static uint64_t kemufuzzer_rdmsr(uint32_t index);
++static Bit8u    pack_FPU_TW(Bit16u twd);
++static void     write_dqword(bx_address addr, Bit8u *data);
++static int32_t  peek_memory(bx_address addr, uint32_t size, uint8_t *buf);
++
++void bx_instr_initialize(unsigned cpu)
++{
++  assert(cpu == 0);
++  assert(getenv("KEMUFUZZER_PRE_STATE"));
++  assert(getenv("KEMUFUZZER_POST_STATE"));
++  assert(getenv("KEMUFUZZER_KERNEL_VERSION"));
++  assert(getenv("KEMUFUZZER_KERNEL_CHECKSUM"));
++  assert(getenv("KEMUFUZZER_TESTCASE_CHECKSUM"));
++  
++  kemufuzzer_state.initialized = 1;
++
++  BX_INFO(("[KEmuFuzzer] initialized"));
++}
++
++void bx_instr_outp(Bit16u addr, unsigned len, unsigned val)
++{
++  switch (addr) {
++  case KEMUFUZZER_HYPERCALL_START_TESTCASE:
++    kemufuzzer_start();
++    break;
++  case KEMUFUZZER_HYPERCALL_STOP_TESTCASE: {
++    int r;
++    unsigned short n;
++    
++    r = peek_memory(RIP + BX_CPU_THIS_PTR sregs[BX_SEG_REG_CS].cache.u.segment.base + 2, sizeof(n), (uint8_t *) &n);
++    assert(r != -1);
++
++    BX_INFO(("[KEmuFuzzer] interrupt #%x -- eip: %.8x, prev_eip: %.8x\n", 
++	     n, GET32L(RIP), GET32L(BX_CPU_THIS_PTR prev_rip)));
++
++    kemufuzzer_stop(n);
++    break;
++  }
++  }
++}
++
++static uint64_t kemufuzzer_rdmsr(uint32_t index)
++{
++  uint64_t v;
++
++  BX_CPU_THIS_PTR rdmsr(index, &v);
++
++  return v;
++}
++
++static void kemufuzzer_start(void)
++{
++  assert(kemufuzzer_state.initialized);
++
++  BX_INFO(("[KEmuFuzzer] testcase started -- eip: %.8x, prev_eip: %.8x\n", 
++	   GET32L(RIP), GET32L(BX_CPU_THIS_PTR prev_rip)));
++
++ /* Enable tracing */
++  kemufuzzer_state.signalled = 1;
++
++  /* Dump current state */
++  kemufuzzer_save(KEMUFUZZER_PRE_STATE, EXCEPTION_NONE);
++}
++
++static void kemufuzzer_stop(int exception_number)
++{
++  if (kemufuzzer_state.signalled == 0)
++    return;
++
++  BX_INFO(("[KEmuFuzzer] testcase completed -- excp: %x, eip: %.8x, prev_eip: %.8x\n", 
++	   exception_number, GET32L(RIP), GET32L(BX_CPU_THIS_PTR prev_rip)));
++
++  /* Disable tracing */
++  kemufuzzer_state.signalled = 0;
++
++  /* Dump current state */
++  kemufuzzer_save(KEMUFUZZER_POST_STATE, exception_number);
++}
++
++static void kemufuzzer_save(int t, int exception_number)
++{
++  header_t h;
++  cpu_state_t s;
++  char outfile[PATH_MAX], tempfile[PATH_MAX];
++  file f;
++  int r, i;
++  unsigned char tmp[1024];
++
++  // Initialization
++  memset(&s, 0, sizeof(s));
++
++  // Get output file name
++  strncpy(tempfile, "/tmp/kemufuzzer-XXXXXX", PATH_MAX - 1);
++  strncpy(outfile, t == KEMUFUZZER_PRE_STATE ? getenv("KEMUFUZZER_PRE_STATE") : getenv("KEMUFUZZER_POST_STATE"), PATH_MAX - 1);
++  mkstemp(tempfile);
++  f = fopen(tempfile, "w");
++  assert(f);
++
++  // Fill header
++  h.magic    = 0xefef;
++  h.version  = 0x0001;
++  h.emulator = EMULATOR_BOCHS;
++  strncpy(h.kernel_version, getenv("KEMUFUZZER_KERNEL_VERSION"), sizeof(h.kernel_version));
++  strncpy(h.kernel_checksum, getenv("KEMUFUZZER_KERNEL_CHECKSUM"), sizeof(h.kernel_checksum));
++  strncpy(h.testcase_checksum, getenv("KEMUFUZZER_TESTCASE_CHECKSUM"), sizeof(h.testcase_checksum));
++  h.type     = t == KEMUFUZZER_PRE_STATE ? PRE_TESTCASE : POST_TESTCASE;
++  h.mem_size = BX_MEM(0)->get_memory_len();
++  h.cpusno   = 1;
++  h.ioports[0] = KEMUFUZZER_HYPERCALL_START_TESTCASE; h.ioports[1] = KEMUFUZZER_HYPERCALL_STOP_TESTCASE;
++
++  // Dump header to disk
++  r = fwrite(f, &h, sizeof(h));
++  assert(r == sizeof(h));
++
++  // General purpose registers
++  s.regs_state.rax = RAX;
++  s.regs_state.rbx = RBX;
++  s.regs_state.rcx = RCX;
++  s.regs_state.rdx = RDX;
++  s.regs_state.rsi = RSI;
++  s.regs_state.rdi = RDI;
++  s.regs_state.rsp = RSP;
++  s.regs_state.rbp = RBP;
++
++  s.regs_state.rflags = BX_CPU_THIS_PTR read_eflags();
++
++  if (t == KEMUFUZZER_PRE_STATE) 
++    s.regs_state.rip = RIP;
++  else
++    s.regs_state.rip = BX_CPU_THIS_PTR prev_rip;
++
++  printf("RIP: %.16lx ", RIP);
++
++  peek_memory(RIP, 8, tmp);
++  for (r = 0; r < 8; r++) {
++    printf("\\x%.2x", tmp[r]);
++  }
++  printf("\n");
++
++  printf("RSP: %.16lx\n", RSP);
++  printf("RSI: %.16lx\n", RSI);
++
++  // System registers
++  s.sregs_state.cr0 = BX_CPU_THIS_PTR cr0.get32();
++  s.sregs_state.cr2 = BX_CPU_THIS_PTR cr2;
++  s.sregs_state.cr3 = BX_CPU_THIS_PTR cr3;
++  s.sregs_state.cr4 = BX_CPU_THIS_PTR cr4.get32();
++
++  // Debug registers
++  s.sregs_state.dr0 = BX_CPU_THIS_PTR dr[0];
++  s.sregs_state.dr1 = BX_CPU_THIS_PTR dr[1];
++  s.sregs_state.dr2 = BX_CPU_THIS_PTR dr[2];
++  s.sregs_state.dr3 = BX_CPU_THIS_PTR dr[3];
++  s.sregs_state.dr6 = BX_CPU_THIS_PTR dr6;
++  s.sregs_state.dr7 = BX_CPU_THIS_PTR dr7;
++  
++  // The DR7 register should have been pushed on the top of the stack -- verify
++  // this assumption
++  Bit32u saved_dr7;
++  peek_memory(RSP+BX_CPU_THIS_PTR sregs[BX_SEG_REG_SS].cache.u.segment.base, 
++	      sizeof(BX_CPU_THIS_PTR dr7), (uint8_t*) &saved_dr7);
++  assert(BX_CPU_THIS_PTR dr7 == saved_dr7);
++
++  // Segment registers
++  get_bochs_segment(s.sregs_state.cs,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_CS]);
++  get_bochs_segment(s.sregs_state.ds,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_DS]);
++  get_bochs_segment(s.sregs_state.es,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_ES]);
++  get_bochs_segment(s.sregs_state.fs,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_FS]);
++  get_bochs_segment(s.sregs_state.gs,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_GS]);
++  get_bochs_segment(s.sregs_state.ss,  BX_CPU_THIS_PTR sregs[BX_SEG_REG_SS]);
++  get_bochs_segment(s.sregs_state.tr,  BX_CPU_THIS_PTR tr);
++  get_bochs_segment(s.sregs_state.ldt, BX_CPU_THIS_PTR ldtr);
++
++  // Tables
++  get_bochs_table(s.sregs_state.idtr, BX_CPU_THIS_PTR idtr);
++  get_bochs_table(s.sregs_state.gdtr, BX_CPU_THIS_PTR gdtr);
++
++  s.sregs_state.efer = BX_CPU_THIS_PTR efer.get32();
++
++  // Exception
++  s.exception_state.vector = exception_number;
++  s.exception_state.error_code = 0;
++
++  // Save FPU state
++  kemufuzzer_fxsave(&s.fpu_state);
++
++  // Dump MSR registers
++  s.msrs_state.n = sizeof(MSRs_to_save)/sizeof(int);
++  assert(s.msrs_state.n < MAX_MSRS);
++
++  for (i = 0; i < s.msrs_state.n; i++) {
++    s.msrs_state.msr_regs[i].idx = MSRs_to_save[i];
++    s.msrs_state.msr_regs[i].val = kemufuzzer_rdmsr(MSRs_to_save[i]);
++  }
++
++  // Dump cpu state
++  r = fwrite(f, &s, sizeof(s));
++  assert(r == sizeof(s));
++
++  // Dump mem state
++  for (i = 0; i < h.mem_size; i += sizeof(tmp)) {
++    memset(tmp, 0, sizeof(tmp));
++    peek_memory(i, sizeof(tmp), tmp);
++    r = fwrite(f, &tmp, sizeof(tmp));
++    assert(r == sizeof(tmp));
++  }
++
++  fclose(f);
++
++  rename(tempfile, outfile);
++  BX_INFO(("Dumped CPU & MEM state to (%s -> %s)\n", tempfile, outfile));
++}
++
++static Bit8u pack_FPU_TW(Bit16u twd)
++{
++  Bit8u tag_byte = 0;
++
++  if((twd & 0x0003) != 0x0003) tag_byte |= 0x01;
++  if((twd & 0x000c) != 0x000c) tag_byte |= 0x02;
++  if((twd & 0x0030) != 0x0030) tag_byte |= 0x04;
++  if((twd & 0x00c0) != 0x00c0) tag_byte |= 0x08;
++  if((twd & 0x0300) != 0x0300) tag_byte |= 0x10;
++  if((twd & 0x0c00) != 0x0c00) tag_byte |= 0x20;
++  if((twd & 0x3000) != 0x3000) tag_byte |= 0x40;
++  if((twd & 0xc000) != 0xc000) tag_byte |= 0x80;
++
++  return tag_byte;
++}
++
++static void write_dqword(bx_address addr, Bit8u *data)
++{
++  memcpy((void *) addr, data, sizeof(Bit64u) * 2);
++}
++
++static void kemufuzzer_fxsave(fpu_state_t *pfpu)
++{
++  unsigned index;
++  bx_address addr = (bx_address) pfpu;
++  BxPackedXmmRegister xmm;
++
++  xmm.xmm16u(0) = BX_CPU_THIS_PTR the_i387.get_control_word();
++  xmm.xmm16u(1) = BX_CPU_THIS_PTR the_i387.get_status_word();
++  xmm.xmm16u(2) = pack_FPU_TW(BX_CPU_THIS_PTR the_i387.get_tag_word());
++
++  /* x87 FPU Opcode (16 bits) */
++  /* The lower 11 bits contain the FPU opcode, upper 5 bits are reserved */
++  xmm.xmm16u(3) = BX_CPU_THIS_PTR the_i387.foo;
++
++  /*
++   * x87 FPU IP Offset (32/64 bits)
++   * The contents of this field differ depending on the current
++   * addressing mode (16/32/64 bit) when the FXSAVE instruction was executed:
++   *   + 64-bit mode - 64-bit IP offset
++   *   + 32-bit mode - 32-bit IP offset
++   *   + 16-bit mode - low 16 bits are IP offset; high 16 bits are reserved.
++   * x87 CS FPU IP Selector
++   *   + 16 bit, in 16/32 bit mode only
++   */
++  xmm.xmm32u(2) = (Bit32u)(BX_CPU_THIS_PTR the_i387.fip) & 0xffffffff;
++  xmm.xmm32u(3) =         (BX_CPU_THIS_PTR the_i387.fcs);
++
++  write_dqword(addr, (Bit8u *) &xmm);
++  addr += sizeof(Bit64u) * 2;
++
++  /*
++   * x87 FPU Instruction Operand (Data) Pointer Offset (32/64 bits)
++   * The contents of this field differ depending on the current
++   * addressing mode (16/32 bit) when the FXSAVE instruction was executed:
++   *   + 64-bit mode - 64-bit offset
++   *   + 32-bit mode - 32-bit offset
++   *   + 16-bit mode - low 16 bits are offset; high 16 bits are reserved.
++   * x87 DS FPU Instruction Operand (Data) Pointer Selector
++   *   + 16 bit, in 16/32 bit mode only
++   */
++  xmm.xmm32u(0) = (Bit32u)(BX_CPU_THIS_PTR the_i387.fdp) & 0xffffffff;
++  xmm.xmm32u(1) =         (BX_CPU_THIS_PTR the_i387.fds);
++
++  xmm.xmm32u(2) = BX_MXCSR_REGISTER;
++  xmm.xmm32u(3) = MXCSR_MASK;
++
++  write_dqword(addr, (Bit8u *) &xmm);
++  addr += sizeof(Bit64u) * 2;
++  
++  /* store i387 register file */
++  for(index=0; index < 8; index++) {
++    const floatx80 &fp = BX_FPU_REG(index);
++
++    xmm.xmm64u(0) = fp.fraction;
++    xmm.xmm64u(1) = 0;
++    xmm.xmm16u(4) = fp.exp;
++
++    write_dqword(addr, (Bit8u *) &xmm);
++    addr += sizeof(Bit64u) * 2;
++  }
++
++  /* store XMM register file */
++  for(index=0; index < BX_XMM_REGISTERS; index++) {
++    // save XMM8-XMM15 only in 64-bit mode
++    if (index < 8 || Is64BitMode()) {
++      write_dqword(addr, (Bit8u *) &(BX_CPU_THIS_PTR xmm[index]));
++      addr += sizeof(Bit64u) * 2;
++    }
++  }
++}
++
++static int32_t peek_memory(bx_address addr, uint32_t size, uint8_t *buf)
++{
++  BX_CPU_THIS_PTR access_read_physical(addr, size, buf);
++}
++
++#endif
+diff -Naur bochs-2.4.1-vanilla/instrument/kemufuzzer/instrument.h bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/instrument.h
+--- bochs-2.4.1-vanilla/instrument/kemufuzzer/instrument.h	1970-01-01 01:00:00.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/instrument.h	2010-02-08 14:58:25.000000000 +0100
+@@ -0,0 +1,206 @@
++// possible types passed to BX_INSTR_TLB_CNTRL()
++#define BX_INSTR_MOV_CR3      10
++#define BX_INSTR_INVLPG       11
++#define BX_INSTR_TASKSWITCH   12
++
++// possible types passed to BX_INSTR_CACHE_CNTRL()
++#define BX_INSTR_INVD         20
++#define BX_INSTR_WBINVD       21
++
++// possible types passed to BX_INSTR_FAR_BRANCH()
++#define BX_INSTR_IS_CALL      10
++#define BX_INSTR_IS_RET       11
++#define BX_INSTR_IS_IRET      12
++#define BX_INSTR_IS_JMP       13
++#define BX_INSTR_IS_INT       14
++#define BX_INSTR_IS_SYSCALL   15
++#define BX_INSTR_IS_SYSRET    16
++#define BX_INSTR_IS_SYSENTER  17
++#define BX_INSTR_IS_SYSEXIT   18
++
++// possible types passed to BX_INSTR_PREFETCH_HINT()
++#define BX_INSTR_PREFETCH_NTA 0
++#define BX_INSTR_PREFETCH_T0  1
++#define BX_INSTR_PREFETCH_T1  2
++#define BX_INSTR_PREFETCH_T2  3
++
++
++#if BX_INSTRUMENTATION
++
++class bxInstruction_c;
++
++void bx_instr_init_env(void);
++void bx_instr_exit_env(void);
++
++// called from the CPU core
++
++void bx_instr_initialize(unsigned cpu);
++void bx_instr_exit(unsigned cpu);
++void bx_instr_reset(unsigned cpu, unsigned type);
++void bx_instr_hlt(unsigned cpu);
++void bx_instr_mwait(unsigned cpu, bx_phy_address addr, unsigned len, Bit32u flags);
++void bx_instr_new_instruction(unsigned cpu);
++
++void bx_instr_debug_promt();
++void bx_instr_debug_command(const char *cmd);
++
++void bx_instr_cnear_branch_taken(unsigned cpu, bx_address new_eip);
++void bx_instr_cnear_branch_not_taken(unsigned cpu);
++void bx_instr_ucnear_branch(unsigned cpu, unsigned what, bx_address new_eip);
++void bx_instr_far_branch(unsigned cpu, unsigned what, Bit16u new_cs, bx_address new_eip);
++
++void bx_instr_opcode(unsigned cpu, const Bit8u *opcode, unsigned len, bx_bool is32, bx_bool is64);
++
++void bx_instr_interrupt(unsigned cpu, unsigned vector);
++void bx_instr_exception(unsigned cpu, unsigned vector, unsigned error_code);
++void bx_instr_hwinterrupt(unsigned cpu, unsigned vector, Bit16u cs, bx_address eip);
++
++void bx_instr_tlb_cntrl(unsigned cpu, unsigned what, bx_phy_address new_cr3);
++void bx_instr_cache_cntrl(unsigned cpu, unsigned what);
++void bx_instr_prefetch_hint(unsigned cpu, unsigned what, unsigned seg, bx_address offset);
++void bx_instr_clflush(unsigned cpu, bx_address laddr, bx_phy_address paddr);
++
++void bx_instr_before_execution(unsigned cpu, bxInstruction_c *i);
++void bx_instr_after_execution(unsigned cpu, bxInstruction_c *i);
++void bx_instr_repeat_iteration(unsigned cpu, bxInstruction_c *i);
++
++void bx_instr_inp(Bit16u addr, unsigned len);
++void bx_instr_inp2(Bit16u addr, unsigned len, unsigned val);
++void bx_instr_outp(Bit16u addr, unsigned len, unsigned val);
++
++void bx_instr_mem_data_access(unsigned cpu, unsigned seg, bx_address offset, unsigned len, unsigned rw);
++void bx_instr_lin_access(unsigned cpu, bx_address lin, bx_address phy, unsigned len, unsigned rw);
++
++void bx_instr_phy_write(unsigned cpu, bx_address addr, unsigned len);
++void bx_instr_phy_read(unsigned cpu, bx_address addr, unsigned len);
++
++void bx_instr_wrmsr(unsigned cpu, unsigned addr, Bit64u value);
++
++/* initialization/deinitialization of instrumentalization*/
++#define BX_INSTR_INIT_ENV() bx_instr_init_env()
++#define BX_INSTR_EXIT_ENV() bx_instr_exit_env()
++
++/* simulation init, shutdown, reset */
++#define BX_INSTR_INITIALIZE(cpu_id)      bx_instr_initialize(cpu_id)
++#define BX_INSTR_EXIT(cpu_id)            bx_instr_exit(cpu_id)
++#define BX_INSTR_RESET(cpu_id, type)     bx_instr_reset(cpu_id, type)
++#define BX_INSTR_HLT(cpu_id)             bx_instr_hlt(cpu_id)
++
++#define BX_INSTR_MWAIT(cpu_id, addr, len, flags) \
++                       bx_instr_mwait(cpu_id, addr, len, flags)
++
++#define BX_INSTR_NEW_INSTRUCTION(cpu_id) bx_instr_new_instruction(cpu_id)
++
++/* called from command line debugger */
++#define BX_INSTR_DEBUG_PROMPT()          bx_instr_debug_promt()
++#define BX_INSTR_DEBUG_CMD(cmd)          bx_instr_debug_cmd(cmd)
++
++/* branch resoultion */
++#define BX_INSTR_CNEAR_BRANCH_TAKEN(cpu_id, new_eip)       bx_instr_cnear_branch_taken(cpu_id, new_eip)
++#define BX_INSTR_CNEAR_BRANCH_NOT_TAKEN(cpu_id)   bx_instr_cnear_branch_not_taken(cpu_id)
++#define BX_INSTR_UCNEAR_BRANCH(cpu_id, what, new_eip)      bx_instr_ucnear_branch(cpu_id, what, new_eip)
++#define BX_INSTR_FAR_BRANCH(cpu_id, what, new_cs, new_eip) bx_instr_far_branch(cpu_id, what, new_cs, new_eip)
++
++/* decoding completed */
++#define BX_INSTR_OPCODE(cpu_id, opcode, len, is32, is64) \
++                       bx_instr_opcode(cpu_id, opcode, len, is32, is64)
++
++/* exceptional case and interrupt */
++#define BX_INSTR_EXCEPTION(cpu_id, vector, error_code) \
++                bx_instr_exception(cpu_id, vector, error_code)
++
++#define BX_INSTR_INTERRUPT(cpu_id, vector) bx_instr_interrupt(cpu_id, vector)
++#define BX_INSTR_HWINTERRUPT(cpu_id, vector, cs, eip) bx_instr_hwinterrupt(cpu_id, vector, cs, eip)
++
++/* TLB/CACHE control instruction executed */
++#define BX_INSTR_CLFLUSH(cpu_id, laddr, paddr)    bx_instr_clflush(cpu_id, laddr, paddr)
++#define BX_INSTR_CACHE_CNTRL(cpu_id, what)        bx_instr_cache_cntrl(cpu_id, what)
++#define BX_INSTR_TLB_CNTRL(cpu_id, what, new_cr3) bx_instr_tlb_cntrl(cpu_id, what, new_cr3)
++#define BX_INSTR_PREFETCH_HINT(cpu_id, what, seg, offset) \
++                       bx_instr_prefetch_hint(cpu_id, what, seg, offset)
++
++/* execution */
++#define BX_INSTR_BEFORE_EXECUTION(cpu_id, i)  bx_instr_before_execution(cpu_id, i)
++#define BX_INSTR_AFTER_EXECUTION(cpu_id, i)   bx_instr_after_execution(cpu_id, i)
++#define BX_INSTR_REPEAT_ITERATION(cpu_id, i)  bx_instr_repeat_iteration(cpu_id, i)
++
++/* memory access */
++#define BX_INSTR_LIN_ACCESS(cpu_id, lin, phy, len, rw)  bx_instr_lin_access(cpu_id, lin, phy, len, rw)
++
++/* memory access */
++#define BX_INSTR_MEM_DATA_ACCESS(cpu_id, seg, offset, len, rw) bx_instr_mem_data_access(cpu_id, seg, offset, len, rw)
++
++/* called from memory object */
++#define BX_INSTR_PHY_WRITE(cpu_id, addr, len) bx_instr_phy_write(cpu_id, addr, len)
++#define BX_INSTR_PHY_READ(cpu_id, addr, len)  bx_instr_phy_read(cpu_id, addr, len)
++
++/* feedback from device units */
++#define BX_INSTR_INP(addr, len)               bx_instr_inp(addr, len)
++#define BX_INSTR_INP2(addr, len, val)         bx_instr_inp2(addr, len, val)
++#define BX_INSTR_OUTP(addr, len, val)         bx_instr_outp(addr, len, val)
++
++/* wrmsr callback */
++#define BX_INSTR_WRMSR(cpu_id, addr, value)   bx_instr_wrmsr(cpu_id, addr, value)
++
++#else
++
++/* initialization/deinitialization of instrumentalization */
++#define BX_INSTR_INIT_ENV()
++#define BX_INSTR_EXIT_ENV()
++
++/* simulation init, shutdown, reset */
++#define BX_INSTR_INITIALIZE(cpu_id)
++#define BX_INSTR_EXIT(cpu_id)
++#define BX_INSTR_RESET(cpu_id, type)
++#define BX_INSTR_HLT(cpu_id)
++#define BX_INSTR_MWAIT(cpu_id, addr, len, flags)
++#define BX_INSTR_NEW_INSTRUCTION(cpu_id)
++
++/* called from command line debugger */
++#define BX_INSTR_DEBUG_PROMPT()
++#define BX_INSTR_DEBUG_CMD(cmd)
++
++/* branch resoultion */
++#define BX_INSTR_CNEAR_BRANCH_TAKEN(cpu_id, new_eip)
++#define BX_INSTR_CNEAR_BRANCH_NOT_TAKEN(cpu_id)
++#define BX_INSTR_UCNEAR_BRANCH(cpu_id, what, new_eip)
++#define BX_INSTR_FAR_BRANCH(cpu_id, what, new_cs, new_eip)
++
++/* decoding completed */
++#define BX_INSTR_OPCODE(cpu_id, opcode, len, is32, is64)
++
++/* exceptional case and interrupt */
++#define BX_INSTR_EXCEPTION(cpu_id, vector, error_code)
++#define BX_INSTR_INTERRUPT(cpu_id, vector)
++#define BX_INSTR_HWINTERRUPT(cpu_id, vector, cs, eip)
++
++/* TLB/CACHE control instruction executed */
++#define BX_INSTR_CLFLUSH(cpu_id, laddr, paddr)
++#define BX_INSTR_CACHE_CNTRL(cpu_id, what)
++#define BX_INSTR_TLB_CNTRL(cpu_id, what, new_cr3)
++#define BX_INSTR_PREFETCH_HINT(cpu_id, what, seg, offset)
++
++/* execution */
++#define BX_INSTR_BEFORE_EXECUTION(cpu_id, i)
++#define BX_INSTR_AFTER_EXECUTION(cpu_id, i)
++#define BX_INSTR_REPEAT_ITERATION(cpu_id, i)
++
++/* memory access */
++#define BX_INSTR_LIN_ACCESS(cpu_id, lin, phy, len, rw)
++
++/* memory access */
++#define BX_INSTR_MEM_DATA_ACCESS(cpu_id, seg, offset, len, rw)
++
++/* called from memory object */
++#define BX_INSTR_PHY_WRITE(cpu_id, addr, len)
++#define BX_INSTR_PHY_READ(cpu_id, addr, len)
++
++/* feedback from device units */
++#define BX_INSTR_INP(addr, len)
++#define BX_INSTR_INP2(addr, len, val)
++#define BX_INSTR_OUTP(addr, len, val)
++
++/* wrmsr callback */
++#define BX_INSTR_WRMSR(cpu_id, addr, value)
++
++#endif
+diff -Naur bochs-2.4.1-vanilla/instrument/kemufuzzer/Makefile bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/Makefile
+--- bochs-2.4.1-vanilla/instrument/kemufuzzer/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/Makefile	2010-02-08 14:58:25.000000000 +0100
+@@ -0,0 +1,80 @@
++# Copyright (C) 2001  MandrakeSoft S.A.
++#
++#   MandrakeSoft S.A.
++#   43, rue d'Aboukir
++#   75002 Paris - France
++#   http://www.linux-mandrake.com/
++#   http://www.mandrakesoft.com/
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
++
++
++
++.SUFFIXES: .cc
++
++srcdir = .
++
++
++SHELL = /bin/sh
++
++
++
++CC = gcc
++CFLAGS = -g -O2 -D_FILE_OFFSET_BITS=64 -D_LARGE_FILES -pthread
++CXX = g++
++CXXFLAGS = -g -O2 -D_FILE_OFFSET_BITS=64 -D_LARGE_FILES -pthread
++
++LDFLAGS = 
++LIBS =  -lm -lz
++RANLIB = ranlib
++
++
++# ===========================================================
++# end of configurable options
++# ===========================================================
++
++
++BX_OBJS = \
++  instrument.o
++
++BX_INCLUDES = \
++	x86.h \
++	x86_cpustate.h
++
++BX_INCDIRS = -I../.. -I$(srcdir)/../.. -I. -I$(srcdir)/.
++
++.cc.o:
++	$(CXX) -c $(CXXFLAGS) $(BX_INCDIRS) $< -o $@
++
++
++.c.o:
++	$(CC) -c $(CFLAGS) $(BX_INCDIRS) $< -o $@
++
++
++
++libinstrument.a: $(BX_OBJS)
++	rm -f  libinstrument.a
++	ar rv $@ $(BX_OBJS)
++	$(RANLIB) libinstrument.a
++
++$(BX_OBJS): $(BX_INCLUDES)
++
++
++clean:
++	rm -f  *.o
++	rm -f  *.a
++
++dist-clean: clean
++	rm -f  Makefile
+diff -Naur bochs-2.4.1-vanilla/instrument/kemufuzzer/Makefile.in bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/Makefile.in
+--- bochs-2.4.1-vanilla/instrument/kemufuzzer/Makefile.in	1970-01-01 01:00:00.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/instrument/kemufuzzer/Makefile.in	2010-02-08 14:58:25.000000000 +0100
+@@ -0,0 +1,80 @@
++# Copyright (C) 2001  MandrakeSoft S.A.
++#
++#   MandrakeSoft S.A.
++#   43, rue d'Aboukir
++#   75002 Paris - France
++#   http://www.linux-mandrake.com/
++#   http://www.mandrakesoft.com/
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
++
++
++
++@SUFFIX_LINE@
++
++srcdir = @srcdir@
++VPATH = @srcdir@
++
++SHELL = /bin/sh
++
++@SET_MAKE@
++
++CC = @CC@
++CFLAGS = @CFLAGS@
++CXX = @CXX@
++CXXFLAGS = @CXXFLAGS@
++
++LDFLAGS = @LDFLAGS@
++LIBS = @LIBS@
++RANLIB = @RANLIB@
++
++
++# ===========================================================
++# end of configurable options
++# ===========================================================
++
++
++BX_OBJS = \
++  instrument.o
++
++BX_INCLUDES = \
++	x86.h \
++	x86_cpustate.h
++
++BX_INCDIRS = -I../.. -I$(srcdir)/../.. -I. -I$(srcdir)/.
++
++.@CPP_SUFFIX@.o:
++	$(CXX) -c $(CXXFLAGS) $(BX_INCDIRS) @CXXFP@$< @OFP@$@
++
++
++.c.o:
++	$(CC) -c $(CFLAGS) $(BX_INCDIRS) @CFP@$< @OFP@$@
++
++
++
++libinstrument.a: $(BX_OBJS)
++	@RMCOMMAND@ libinstrument.a
++	@MAKELIB@ $(BX_OBJS)
++	$(RANLIB) libinstrument.a
++
++$(BX_OBJS): $(BX_INCLUDES)
++
++
++clean:
++	@RMCOMMAND@ *.o
++	@RMCOMMAND@ *.a
++
++dist-clean: clean
++	@RMCOMMAND@ Makefile
+diff -Naur bochs-2.4.1-vanilla/README.KEmuFuzzer bochs-2.4.1-kemufuzzer/README.KEmuFuzzer
+--- bochs-2.4.1-vanilla/README.KEmuFuzzer	1970-01-01 01:00:00.000000000 +0100
++++ bochs-2.4.1-kemufuzzer/README.KEmuFuzzer	2010-02-08 15:45:50.000000000 +0100
+@@ -0,0 +1,5 @@
++To compile BOCHS:
++
++$ autoconf
++$ ./configure --with-x --with-x11 --with-nogui --with-wx --with-term --enable-all-optimizations --enable-idle-hack --enable-cpu-level=6 --enable-ne2000 --enable-fast-function-calls --enable-vmx --enable-mmx  --enable-sse=4 --enable-sse-extension --enable-sep --with-rfb --enable-x86-64 --enable-apic --enable-acpi --enable-pci --enable-configurable-msrs --enable-repeat-speedups --enable-ignore-bad-msr --enable-host-specific-asms --enable-instrumentation="instrument/kemufuzzer" --enable-x86-debugger --enable-alignment-check
++$ make
