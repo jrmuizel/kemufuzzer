@@ -34,5 +34,7 @@ $ ././kemufuzzer emu:KVM kerneldir:$./kernel kernel:./kernel/kernel floppy:./ker
 
 {{{
 $ ./x86_cpustate_diff ./states/vmware/vm_CVE-2009-2267.0000.post ./states/kvm/vm_CVE-2009-2267.0000.post
-
+                                                      Oracle          VMware
+--------------------------------------------------------------------------------
+cpu[0].exception_state.error_code                       6                2
 }}}
