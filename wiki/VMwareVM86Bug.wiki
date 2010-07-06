@@ -25,7 +25,7 @@ $ ./kemufuzzer emu:VMWARE kerneldir:$./kernel kernel:./kernel/kernel floppy:./ke
    * Run the same test-case in the KVM-based oracle (starting from the same initial state):
 
 {{{
-$ ././kemufuzzer emu:KVM kerneldir:$./kernel kernel:./kernel/kernel floppy:./kernel/floppy.img testcase:../test-cases/vm_CVE-2009-2267.0000.testcase pre:./states/vmware/vm_CVE-2009-2267.0000.pre post:./states/kvm/vmware/vm_CVE-2009-2267.0000.post
+$ ./kemufuzzer emu:KVM kerneldir:$./kernel kernel:./kernel/kernel floppy:./kernel/floppy.img testcase:../test-cases/vm_CVE-2009-2267.0000.testcase pre:./states/vmware/vm_CVE-2009-2267.0000.pre post:./states/kvm/vmware/vm_CVE-2009-2267.0000.post
 ...
 ...
 [*] Flushing state '/tmp/kemufuzzer-post-zE813H' -> './states/kvm/vm_CVE-2009-2267.0000.post'
