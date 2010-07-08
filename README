@@ -134,7 +134,7 @@ NOTES
 =====
 
 In order to use KEmuFuzzer with BOCHS, QEMU, and VirtualBox you need to patch
-their code. Patches are available on the web.
+their code. Patches are available in the directory named 'patches'.
 
 
 ADDING SUPPORT FOR A NEW EMULATOR
